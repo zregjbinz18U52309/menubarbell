@@ -1,7 +1,18 @@
 // Squat — un petit gars qui fait des squats dans la barre de menus.
 // Plus le processeur travaille, plus la barre est chargée et plus les répétitions sont lentes.
+// `--distant <hôte> [--nom <nom>]` : il suit la charge d'un AUTRE Mac par SSH (justaucorps bleu).
 import AppKit
 import Darwin
+
+// MARK: - Mode (ce Mac, ou un Mac distant par SSH)
+
+func argument(_ name: String) -> String? {
+    let a = CommandLine.arguments
+    guard let i = a.firstIndex(of: name), i + 1 < a.count else { return nil }
+    return a[i + 1]
+}
+let remoteHost = argument("--distant")
+let machineName = argument("--nom") ?? (remoteHost == nil ? "CPU" : remoteHost!)
 
 // MARK: - Mesure de la charge CPU
 
@@ -41,6 +52,57 @@ final class CPUMonitor {
     }
 }
 
+// MARK: - Charge d'un Mac distant
+
+/// Une seule connexion SSH qui reste ouverte : `iostat -n0 -w 2` sur le Mac distant écrit une ligne toutes les 2 s
+/// (« us sy id 1m 5m 15m ») ; charge = 1 − id / 100. Relancée 15 s après une coupure. Clé SSH sans mot de passe requise.
+final class RemoteMonitor {
+    private let host: String
+    private var process: Process?
+    private var buffer = ""
+    private var skippedFirst = false
+    private(set) var load = 0.0
+    private(set) var lastUpdate = Date.distantPast
+
+    init(host: String) { self.host = host; start() }
+
+    var online: Bool { Date().timeIntervalSince(lastUpdate) < 12 }
+
+    private func start() {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=10",
+                       "-o", "ServerAliveCountMax=2", host, "iostat -n0 -w 2"]
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        buffer = ""; skippedFirst = false
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async { self?.consume(text) }
+        }
+        p.terminationHandler = { [weak self] _ in
+            out.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { self?.start() }
+        }
+        do { try p.run(); process = p } catch {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.start() }
+        }
+    }
+
+    private func consume(_ text: String) {
+        buffer += text
+        while let nl = buffer.firstIndex(of: "\n") {
+            let line = String(buffer[..<nl]); buffer.removeSubrange(...nl)
+            let f = line.split(separator: " ").compactMap { Double($0) }
+            guard f.count >= 3 else { continue }               // lignes d'en-tête
+            if !skippedFirst { skippedFirst = true; continue }  // 1re ligne = moyenne depuis le démarrage
+            load = max(0, min(1, 1 - f[2] / 100))
+            lastUpdate = Date()
+        }
+    }
+}
+
 // MARK: - Niveaux de charge
 
 struct Level {
@@ -74,8 +136,9 @@ let canvas = CGSize(width: cols, height: rows)
 let barRowHigh = 4, barRowLow = 9  // ligne de la barre : debout / en bas du squat
 
 // Encres de la grille : 0 = vide, 1 = corps et barre (blanc ou noir selon la barre de menus),
-// 2 = justaucorps rouge, 3 = disques noirs
-let singletRed = NSColor(srgbRed: 0.86, green: 0.11, blue: 0.14, alpha: 1)
+// 2 = justaucorps (rouge pour ce Mac, bleu pour un Mac distant), 3 = disques noirs
+let singletColor = remoteHost == nil ? NSColor(srgbRed: 0.86, green: 0.11, blue: 0.14, alpha: 1)
+                                     : NSColor(srgbRed: 0.13, green: 0.40, blue: 0.90, alpha: 1)
 let plateBlack = NSColor(srgbRed: 0.08, green: 0.08, blue: 0.08, alpha: 1)
 
 struct PixelGrid {
@@ -153,7 +216,7 @@ func drawFrame(level: Level, t: CGFloat, jitter: CGFloat, ink: NSColor) {
         g.fill(c, c + 1, bar + height / 2 - 1, bar + height / 2 - 1)
     }
 
-    let palette: [UInt8: NSColor] = [1: ink, 2: singletRed, 3: plateBlack]
+    let palette: [UInt8: NSColor] = [1: ink, 2: singletColor, 3: plateBlack]
     NSGraphicsContext.current?.shouldAntialias = false
     for r in 0..<rows { for c in 0..<cols where g[c, r] != 0 {
         palette[g[c, r]]!.setFill()
@@ -162,8 +225,10 @@ func drawFrame(level: Level, t: CGFloat, jitter: CGFloat, ink: NSColor) {
 }
 
 /// `dark` : barre de menus sombre → corps et barre en blanc, sinon en noir.
-func makeImage(level: Level, t: CGFloat, jitter: CGFloat, dark: Bool) -> NSImage {
+/// `dim` : Mac distant injoignable → bonhomme grisé, au repos.
+func makeImage(level: Level, t: CGFloat, jitter: CGFloat, dark: Bool, dim: Bool = false) -> NSImage {
     NSImage(size: canvas, flipped: false) { _ in
+        if dim { NSGraphicsContext.current?.cgContext.setAlpha(0.35) }
         drawFrame(level: level, t: t, jitter: jitter, ink: dark ? .white : .black)
         return true
     }
@@ -174,11 +239,12 @@ func makeImage(level: Level, t: CGFloat, jitter: CGFloat, dark: Bool) -> NSImage
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: canvas.width + 4)
     private let monitor = CPUMonitor()
+    private let remote = remoteHost.map { RemoteMonitor(host: $0) }
     private var smoothedLoad = 0.0
     private var currentLevel = 0
     private var phase = 0.0
     private var lastTick = Date()
-    private let loadItem = NSMenuItem(title: "CPU : —", action: nil, keyEquivalent: "")
+    private let loadItem = NSMenuItem(title: "\(machineName) : —", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
@@ -195,7 +261,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateLoad() {
-        let raw = monitor.sample()
+        if let remote = remote, !remote.online {
+            smoothedLoad = 0; currentLevel = 0
+            loadItem.title = "\(machineName) : injoignable"
+            return
+        }
+        let raw = remote?.load ?? monitor.sample()
         smoothedLoad = smoothedLoad * 0.6 + raw * 0.4
 
         // Hystérésis : on ne redescend que si la charge passe nettement sous le seuil
@@ -204,8 +275,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentLevel = target
         }
         let plates = levels[currentLevel].plates.count
-        loadItem.title = String(format: "CPU : %.0f %%  ·  %d disque%@ par côté",
-                                smoothedLoad * 100, plates, plates > 1 ? "s" : "")
+        loadItem.title = String(format: "%@ : %.0f %%  ·  %d disque%@ par côté",
+                                machineName, smoothedLoad * 100, plates, plates > 1 ? "s" : "")
     }
 
     private func animate() {
@@ -230,13 +301,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let button = statusItem.button else { return }
         let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        button.image = makeImage(level: level, t: t, jitter: jitter, dark: dark)
+        button.image = makeImage(level: level, t: t, jitter: jitter, dark: dark, dim: remote.map { !$0.online } ?? false)
     }
 }
 
 // MARK: - Point d'entrée
 
-if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview" {
+if let previewPath = argument("--preview") {
     // Planche d'aperçu : une ligne par niveau ; trois positions sur barre claire puis sur barre sombre ; ×8
     let scale: CGFloat = 8
     let cols: [(t: Double, dark: Bool)] = [0, 0.25, 0.5, 0.75, 1].map { ($0, false) } + [0, 0.25, 0.5, 0.75, 1].map { ($0, true) }
@@ -261,7 +332,7 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview" {
             ctx.restoreGState()
         }
     }
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: previewPath))
     exit(0)
 }
 

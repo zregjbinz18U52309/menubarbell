@@ -36,10 +36,23 @@ cd menubarbell
 `build.sh` compile l'app, l'installe dans `~/Applications/Squat.app`, la lance et active son démarrage automatique à l'ouverture de session.
 Relance-le après chaque modification de `main.swift`.
 
+## Suivre un autre Mac (justaucorps bleu)
+
+```bash
+./build.sh --mini            # suit l'hôte SSH « mini », affiché « Mac mini »
+./build.sh --mini serveur "Mon serveur"
+```
+
+Installe `SquatMini.app` à côté de la version rouge : même haltérophile, en bleu, qui suit la charge d'un autre Mac.
+Il lui faut un accès SSH sans mot de passe (clé, alias dans `~/.ssh/config`). Une seule connexion reste ouverte
+(`iostat` toutes les 2 s sur le Mac distant). Mac injoignable : le bonhomme est grisé et le menu affiche « injoignable ».
+
 ## Désinstallation
 
 ```bash
 launchctl bootout gui/$(id -u)/local.squat; rm ~/Library/LaunchAgents/local.squat.plist; rm -rf ~/Applications/Squat.app
+# version bleue :
+launchctl bootout gui/$(id -u)/local.squatmini; rm ~/Library/LaunchAgents/local.squatmini.plist; rm -rf ~/Applications/SquatMini.app
 ```
 
 ## Le code
